@@ -198,7 +198,7 @@ typedef struct _fcgi_hash {
 typedef struct _fcgi_req_hook 	fcgi_req_hook;
 
 struct _fcgi_req_hook {
-	void(*on_accept)(bool firstAccept);
+	void(*on_accept)(bool fromActive);
 	void(*on_read)(bool keptAlive);
 	void(*on_close)(void);
 };
@@ -209,6 +209,7 @@ struct _fcgi_request {
 	int            fd;
 	int            id;
 	int            keep;
+	bool           kept_alive;
 #ifdef TCP_NODELAY
 	int            nodelay;
 #endif
@@ -1082,6 +1083,9 @@ static int fcgi_read_request(fcgi_request *req)
 	if (hdr.type == FCGI_BEGIN_REQUEST && len == sizeof(fcgi_begin_request)) {
 		fcgi_begin_request *b;
 
+		req->hook.on_read(req->kept_alive);
+		req->kept_alive = true;
+
 		if (safe_read(req, buf, len+padding) != len+padding) {
 			return 0;
 		}
@@ -1359,8 +1363,6 @@ int fcgi_accept_request(fcgi_request *req)
 	OVERLAPPED ov;
 #endif
 
-	bool keptAlive = false;
-	bool firstAccept = false;
 	while (1) {
 		if (req->fd < 0) {
 			while (1) {
@@ -1368,8 +1370,8 @@ int fcgi_accept_request(fcgi_request *req)
 					return -1;
 				}
 
-				req->hook.on_accept(firstAccept);
-				firstAccept = keptAlive = false;
+				req->hook.on_accept(req->kept_alive);
+				req->kept_alive = false;
 #ifdef _WIN32
 				if (!req->tcp) {
 					pipe = (HANDLE)_get_osfhandle(req->listen_socket);
@@ -1477,8 +1479,6 @@ int fcgi_accept_request(fcgi_request *req)
 		} else if (in_shutdown) {
 			return -1;
 		}
-		req->hook.on_read(keptAlive);
-		keptAlive = true;
 		int read_result = fcgi_read_request(req);
 		if (read_result == 1) {
 #ifdef _WIN32
