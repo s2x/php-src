@@ -187,8 +187,8 @@ typedef struct _fcgi_hash {
 typedef struct _fcgi_req_hook 	fcgi_req_hook;
 
 struct _fcgi_req_hook {
-	void(*on_accept)(void);
-	void(*on_read)(void);
+	void(*on_accept)(bool fromActive);
+	void(*on_read)(bool keptAlive);
 	void(*on_close)(void);
 };
 
@@ -198,6 +198,7 @@ struct _fcgi_request {
 	int            fd;
 	int            id;
 	int            keep;
+	bool           kept_alive;
 #ifdef TCP_NODELAY
 	int            nodelay;
 #endif
@@ -856,7 +857,11 @@ static void fcgi_hook_dummy(void) {
 	return;
 }
 
-fcgi_request *fcgi_init_request(int listen_socket, void(*on_accept)(void), void(*on_read)(void), void(*on_close)(void))
+static void fcgi_hook_dummy_bool(bool) {
+	return;
+}
+
+fcgi_request *fcgi_init_request(int listen_socket, void(*on_accept)(bool), void(*on_read)(bool), void(*on_close)(void))
 {
 	fcgi_request *req = calloc(1, sizeof(fcgi_request));
 	req->listen_socket = listen_socket;
@@ -878,8 +883,8 @@ fcgi_request *fcgi_init_request(int listen_socket, void(*on_accept)(void), void(
 
 	*/
 	req->out_pos = req->out_buf;
-	req->hook.on_accept = on_accept ? on_accept : fcgi_hook_dummy;
-	req->hook.on_read = on_read ? on_read : fcgi_hook_dummy;
+	req->hook.on_accept = on_accept ? on_accept : fcgi_hook_dummy_bool;
+	req->hook.on_read = on_read ? on_read : fcgi_hook_dummy_bool;
 	req->hook.on_close = on_close ? on_close : fcgi_hook_dummy;
 
 #ifdef _WIN32
@@ -1066,6 +1071,9 @@ static int fcgi_read_request(fcgi_request *req)
 
 	if (hdr.type == FCGI_BEGIN_REQUEST && len == sizeof(fcgi_begin_request)) {
 		fcgi_begin_request *b;
+
+		req->hook.on_read(req->kept_alive);
+		req->kept_alive = true;
 
 		if (safe_read(req, buf, len+padding) != len+padding) {
 			return 0;
@@ -1351,7 +1359,8 @@ int fcgi_accept_request(fcgi_request *req)
 					return -1;
 				}
 
-				req->hook.on_accept();
+				req->hook.on_accept(req->kept_alive);
+				req->kept_alive = false;
 #ifdef _WIN32
 				if (!req->tcp) {
 					pipe = (HANDLE)_get_osfhandle(req->listen_socket);
@@ -1433,7 +1442,6 @@ int fcgi_accept_request(fcgi_request *req)
 		} else if (in_shutdown) {
 			return -1;
 		}
-		req->hook.on_read();
 		int read_result = fcgi_read_request(req);
 		if (read_result == 1) {
 #ifdef _WIN32
