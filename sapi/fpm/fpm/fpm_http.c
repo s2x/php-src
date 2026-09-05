@@ -13,7 +13,9 @@
  * Persistent connections: a kept FastCGI connection pins one PHP worker, so
  * the gateways together never hold more than pm.max_children of them and
  * requests beyond that wait in the gateway's own queue instead of the kernel
- * backlog. A worker waiting for the next request on a kept connection counts
+ * backlog. The budget is a counter in shared memory rather than a fixed share
+ * per process, so a gateway that happens to get all the clients can still use
+ * every worker. A worker waiting for the next request on a kept connection counts
  * as active, so dynamic spawns spare workers for everyone else as it should.
  * ondemand never reaps such a worker though, and with any pm a pinned worker
  * is unavailable to other FastCGI clients (nginx, the status page), so an
@@ -64,6 +66,8 @@
 #include "fpm_cleanup.h"
 #include "fpm_signals.h"
 #include "fpm_env.h"
+#include "fpm_shm.h"
+#include "fpm_atomic.h"
 #include "zlog.h"
 
 #define FPM_HTTP_GATEWAYS_DEFAULT 2			/* overridable with FPM_HTTP_GATEWAYS until there is a directive */
@@ -88,8 +92,11 @@ struct fpm_http_gateway_s {
 	unsigned nproc;
 	pid_t *pids;
 
+	/* how many persistent connections all the gateways of this pool may hold together */
+	unsigned max_upstreams;
+	atomic_t *upstreams_used;		/* shared between the gateway processes */
+
 	/* gateway process only */
-	unsigned max_upstreams;			/* this process' share of the pool's workers */
 	struct event_base *base;
 	struct evhttp *http;
 	struct sockaddr_storage upstream_addr;
@@ -139,6 +146,33 @@ struct _fpm_http_upstream {
 };
 
 static void fpm_http_pump(struct fpm_http_gateway_s *gw);
+static void fpm_http_retry_later(struct fpm_http_gateway_s *gw);
+
+/* Claims one of the pool's workers for a persistent connection, or fails when they are all taken. */
+static int fpm_http_budget_take(struct fpm_http_gateway_s *gw)
+{
+	while (1) {
+		unsigned long used = *gw->upstreams_used;	/* atomic_t is an integer of some width on every branch of fpm_atomic.h */
+
+		if (used >= gw->max_upstreams) {
+			return 0;
+		}
+		if (atomic_cmp_set(gw->upstreams_used, used, used + 1)) {
+			return 1;
+		}
+	}
+}
+
+static void fpm_http_budget_give_back(struct fpm_http_gateway_s *gw)
+{
+	while (1) {
+		unsigned long used = *gw->upstreams_used;	/* atomic_t is an integer of some width on every branch of fpm_atomic.h */
+
+		if (used == 0 || atomic_cmp_set(gw->upstreams_used, used, used - 1)) {
+			return;
+		}
+	}
+}
 
 /* EAGAIN and EWOULDBLOCK are the same value on most systems, hence the macro dance */
 static inline int fpm_http_would_block(int err)
@@ -458,8 +492,10 @@ static void fpm_http_finish(fpm_http_conn *c, int upstream_ok)
 
 static void fpm_http_upstream_drop(fpm_http_upstream *up)
 {
-	TAILQ_REMOVE(&up->gw->upstreams, up, link);
-	up->gw->nupstreams--;
+	struct fpm_http_gateway_s *gw = up->gw;
+
+	TAILQ_REMOVE(&gw->upstreams, up, link);
+	gw->nupstreams--;
 	if (up->ev_read) {
 		event_free(up->ev_read);
 	}
@@ -469,6 +505,7 @@ static void fpm_http_upstream_drop(fpm_http_upstream *up)
 	close(up->fd);
 	smart_str_free(&up->pending);
 	free(up);
+	fpm_http_budget_give_back(gw);
 }
 
 /* the pool went away mid-request or while idle */
@@ -623,12 +660,17 @@ static void fpm_http_upstream_write(fpm_http_upstream *up, const char *data, siz
 
 static fpm_http_upstream *fpm_http_upstream_new(struct fpm_http_gateway_s *gw)
 {
-	fpm_http_upstream *up = calloc(1, sizeof(*up));
+	fpm_http_upstream *up;
 
+	if (!fpm_http_budget_take(gw)) {
+		return NULL;
+	}
+	up = calloc(1, sizeof(*up));
 	up->gw = gw;
 	up->fd = socket(gw->upstream_addr.ss_family, SOCK_STREAM, 0);
 	if (up->fd < 0) {
 		free(up);
+		fpm_http_budget_give_back(gw);
 		return NULL;
 	}
 	evutil_make_socket_nonblocking(up->fd);
@@ -646,6 +688,7 @@ static fpm_http_upstream *fpm_http_upstream_new(struct fpm_http_gateway_s *gw)
 			event_free(up->ev_write);
 			close(up->fd);
 			free(up);
+			fpm_http_budget_give_back(gw);
 			return NULL;
 		}
 		up->connecting = 1;
@@ -671,15 +714,14 @@ static void fpm_http_pump(struct fpm_http_gateway_s *gw)
 				break;
 			}
 		}
-		if (!idle && gw->nupstreams < gw->max_upstreams) {
+		if (!idle) {
 			idle = fpm_http_upstream_new(gw);
-			if (!idle && gw->nupstreams == 0) {
-				/* cannot even open one connection: fail the whole queue instead of hanging it */
-				while ((c = TAILQ_FIRST(&gw->waiting))) {
-					fpm_http_finish(c, 0);
-				}
-				return;
-			}
+		}
+		if (!idle && gw->nupstreams == 0) {
+			/* no connection of our own and no budget left: another gateway holds every worker,
+			 * so look again shortly instead of waiting for an END_REQUEST that cannot come */
+			fpm_http_retry_later(gw);
+			return;
 		}
 		if (!idle) {
 			return; /* everything busy, the next END_REQUEST calls us again */
@@ -697,6 +739,18 @@ static void fpm_http_pump(struct fpm_http_gateway_s *gw)
 		fpm_http_upstream_write(idle, ZSTR_VAL(c->out.s), ZSTR_LEN(c->out.s));
 		smart_str_free(&c->out);
 	}
+}
+
+static void fpm_http_retry_cb(evutil_socket_t fd, short what, void *arg)
+{
+	fpm_http_pump(arg);
+}
+
+static void fpm_http_retry_later(struct fpm_http_gateway_s *gw)
+{
+	static const struct timeval retry = {0, 2000};
+
+	event_base_once(gw->base, -1, EV_TIMEOUT, fpm_http_retry_cb, gw, &retry);
 }
 
 /* the client went away: stop writing to it, but let the pool finish so the connection stays usable */
@@ -919,6 +973,9 @@ static void fpm_http_cleanup(int which, void *arg) /* {{{ */
 		if (gw->listen_fd >= 0) {
 			close(gw->listen_fd);
 		}
+		if (gw->upstreams_used) {
+			fpm_shm_free((void*)gw->upstreams_used, sizeof(*gw->upstreams_used));
+		}
 		free(gw->pids);
 		free(gw->pool);
 		free(gw->listen_address);
@@ -971,8 +1028,15 @@ int fpm_http_init_main(void) /* {{{ */
 			free(gw);
 			continue;
 		}
-		/* every persistent connection pins a worker, so the gateways share the workers between them */
+		/* every persistent connection pins a worker, so the gateways share one budget */
 		gw->nproc = MIN(nproc_wanted, workers);
+		gw->max_upstreams = workers;
+		gw->upstreams_used = fpm_shm_alloc(sizeof(*gw->upstreams_used));
+		if (!gw->upstreams_used) {
+			zlog(ZLOG_ERROR, "[pool %s] http: cannot allocate shared memory", wp->config->name);
+			return -1;
+		}
+		*gw->upstreams_used = 0;
 		gw->pids = calloc(gw->nproc, sizeof(pid_t));
 		gw->next = gateways;
 		gateways = gw;
@@ -984,7 +1048,6 @@ int fpm_http_init_main(void) /* {{{ */
 			if (gw->pids[i] < 0) {
 				zlog(ZLOG_SYSERROR, "[pool %s] http: fork() failed", wp->config->name);
 			} else if (gw->pids[i] == 0) {
-				gw->max_upstreams = workers / gw->nproc + (i < workers % gw->nproc ? 1 : 0);
 				fpm_http_gateway_run(gw, i);
 				/* not reached */
 			}
