@@ -45,12 +45,12 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <netinet/tcp.h>
 
 #include <event2/event.h>
 #include <event2/http.h>
 #include <event2/http_struct.h>
 #include <event2/buffer.h>
-#include <event2/bufferevent.h>
 #include <event2/keyvalq_struct.h>
 #include <event2/util.h>
 
@@ -117,10 +117,18 @@ struct _fpm_http_conn {
 	int headers_sent;
 };
 
-/* one persistent FastCGI connection to the pool, serving one request at a time */
+/* One persistent FastCGI connection to the pool, serving one request at a time.
+ * Plain socket rather than a bufferevent: the read event is registered once and
+ * never touched, and writes go straight out, which keeps epoll_ctl and the
+ * FIONREAD ioctl that evbuffer_read does out of the hot path. */
 struct _fpm_http_upstream {
 	struct fpm_http_gateway_s *gw;
-	struct bufferevent *bev;
+	int fd;
+	struct event *ev_read;
+	struct event *ev_write;				/* only pending while a write did not fit or we are connecting */
+	int connecting;
+	smart_str pending;					/* not yet written to the pool */
+	size_t pending_off;
 	int busy;							/* a request is in flight, even if its client is gone */
 	fpm_http_conn *current;				/* NULL when idle or when the client went away */
 	TAILQ_ENTRY(_fpm_http_upstream) link;
@@ -131,6 +139,20 @@ struct _fpm_http_upstream {
 };
 
 static void fpm_http_pump(struct fpm_http_gateway_s *gw);
+
+/* EAGAIN and EWOULDBLOCK are the same value on most systems, hence the macro dance */
+static inline int fpm_http_would_block(int err)
+{
+	if (err == EAGAIN) {
+		return 1;
+	}
+#if EWOULDBLOCK != EAGAIN
+	if (err == EWOULDBLOCK) {
+		return 1;
+	}
+#endif
+	return 0;
+}
 static int fpm_http_listen(const char *pool, const char *listen_address, int backlog, int reuseport);
 
 static struct timeval idle_timeout = {FPM_HTTP_IDLE_MS / 1000, (FPM_HTTP_IDLE_MS % 1000) * 1000};
@@ -207,7 +229,7 @@ static int fpm_http_build_request(fpm_http_conn *c)
 	char *decoded, *peer_addr = NULL, buf[64];
 	ev_uint16_t peer_port = 0;
 	smart_str filename = {0};
-	zend_stat_t st;
+	const char *path_info;
 	size_t decoded_len, body_len = evbuffer_get_length(body);
 
 	if (!method || !path || !*path) {
@@ -225,8 +247,15 @@ static int fpm_http_build_request(fpm_http_conn *c)
 		free(decoded);
 		return HTTP_BADREQUEST;
 	}
+	/* Split like nginx' fastcgi_split_path_info ^(.+?\.php)(/.*)$: everything up to and
+	 * including the first ".php" is the script, the rest is PATH_INFO. Doing it here rather
+	 * than letting FPM stat its way to the script keeps one syscall out of every request. */
+	path_info = strstr(decoded, ".php/");
+	if (path_info) {
+		path_info += sizeof(".php") - 1;
+	}
 	smart_str_appends(&filename, c->gw->docroot);
-	smart_str_appends(&filename, decoded);
+	smart_str_appendl(&filename, decoded, path_info ? (size_t)(path_info - decoded) : decoded_len);
 	if (decoded[decoded_len - 1] == '/') {
 		smart_str_appendl(&filename, "index.php", sizeof("index.php") - 1);
 	}
@@ -242,11 +271,8 @@ static int fpm_http_build_request(fpm_http_conn *c)
 	fpm_http_param(c, "DOCUMENT_ROOT", c->gw->docroot);
 	fpm_http_param(c, "SCRIPT_NAME", ZSTR_VAL(filename.s) + strlen(c->gw->docroot));
 	fpm_http_param(c, "SCRIPT_FILENAME", ZSTR_VAL(filename.s));
-	/* Like nginx' fastcgi_split_path_info: when the path continues past the script file,
-	 * hand the whole path over as PATH_INFO and let FPM trim it down to the part after
-	 * the script (and fix SCRIPT_NAME/SCRIPT_FILENAME accordingly). */
-	if (zend_stat(ZSTR_VAL(filename.s), &st) != 0 || !S_ISREG(st.st_mode)) {
-		fpm_http_param(c, "PATH_INFO", decoded);
+	if (path_info) {
+		fpm_http_param(c, "PATH_INFO", path_info);
 	}
 	smart_str_free(&filename);
 	free(decoded);
@@ -434,8 +460,32 @@ static void fpm_http_upstream_drop(fpm_http_upstream *up)
 {
 	TAILQ_REMOVE(&up->gw->upstreams, up, link);
 	up->gw->nupstreams--;
-	bufferevent_free(up->bev);
+	if (up->ev_read) {
+		event_free(up->ev_read);
+	}
+	if (up->ev_write) {
+		event_free(up->ev_write);
+	}
+	close(up->fd);
+	smart_str_free(&up->pending);
 	free(up);
+}
+
+/* the pool went away mid-request or while idle */
+static void fpm_http_upstream_fail(fpm_http_upstream *up, int clean_eof)
+{
+	struct fpm_http_gateway_s *gw = up->gw;
+
+	if (!clean_eof) {
+		zlog(ZLOG_WARNING, "[pool %s] http: upstream '%s': %s", gw->pool, gw->listen_address, strerror(errno));
+	}
+	/* EOF is normal after pm.max_requests or a worker restart; a request in flight is lost though */
+	if (up->current) {
+		fpm_http_finish(up->current, clean_eof);
+		up->current = NULL;
+	}
+	fpm_http_upstream_drop(up);
+	fpm_http_pump(gw);
 }
 
 /* one request finished on this connection, it is free for the next */
@@ -449,7 +499,7 @@ static void fpm_http_request_done(fpm_http_upstream *up)
 	memset(up->rec_hdr, 0, sizeof(up->rec_hdr));
 	up->rec_hdr_len = up->rec_type = up->rec_len = up->rec_pad = 0;
 	if (idle_ms > 0) {
-		bufferevent_set_timeouts(up->bev, &idle_timeout, NULL);
+		event_add(up->ev_read, &idle_timeout);
 	}
 	fpm_http_pump(up->gw);
 }
@@ -498,41 +548,77 @@ static void fpm_http_upstream_data(fpm_http_upstream *up, const char *buf, size_
 	}
 }
 
-static void fpm_http_upstream_read(struct bufferevent *bev, void *arg)
-{
-	struct evbuffer *in = bufferevent_get_input(bev);
-	size_t len = evbuffer_get_length(in);
-
-	fpm_http_upstream_data(arg, (const char*)evbuffer_pullup(in, -1), len);
-	evbuffer_drain(in, len);
-}
-
-static void fpm_http_upstream_event(struct bufferevent *bev, short what, void *arg)
+static void fpm_http_upstream_readcb(evutil_socket_t fd, short what, void *arg)
 {
 	fpm_http_upstream *up = arg;
-	struct fpm_http_gateway_s *gw = up->gw;
+	char buf[16 * 1024];
+	ssize_t n;
 
-	if (what & BEV_EVENT_CONNECTED) {
-		return;
-	}
-	if (what & BEV_EVENT_TIMEOUT) {
+	if (what & EV_TIMEOUT) {
 		/* idle for a while: give the worker back to the pool */
 		if (!up->busy) {
 			fpm_http_upstream_drop(up);
 		}
 		return;
 	}
-	if (what & BEV_EVENT_ERROR) {
-		zlog(ZLOG_WARNING, "[pool %s] http: upstream '%s': %s", gw->pool, gw->listen_address,
-			evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()));
+	do {
+		n = read(fd, buf, sizeof(buf));
+	} while (n < 0 && errno == EINTR);
+
+	if (n > 0) {
+		fpm_http_upstream_data(up, buf, n);
+	} else if (n == 0 || !fpm_http_would_block(errno)) {
+		fpm_http_upstream_fail(up, n == 0);
 	}
-	/* EOF is normal after pm.max_requests or a worker restart; the request in flight is lost though */
-	if (up->current) {
-		fpm_http_finish(up->current, !(what & BEV_EVENT_ERROR));
-		up->current = NULL;
+}
+
+/* Writes whatever is pending; registers the write event only when the socket is full. */
+static void fpm_http_upstream_flush(fpm_http_upstream *up)
+{
+	while (up->pending.s && up->pending_off < ZSTR_LEN(up->pending.s)) {
+		ssize_t n = write(up->fd, ZSTR_VAL(up->pending.s) + up->pending_off, ZSTR_LEN(up->pending.s) - up->pending_off);
+
+		if (n > 0) {
+			up->pending_off += n;
+		} else if (n < 0 && errno == EINTR) {
+			continue;
+		} else if (n < 0 && fpm_http_would_block(errno)) {
+			event_add(up->ev_write, NULL);
+			return;
+		} else {
+			fpm_http_upstream_fail(up, 0);
+			return;
+		}
 	}
-	fpm_http_upstream_drop(up);
-	fpm_http_pump(gw);
+	smart_str_free(&up->pending);
+	up->pending_off = 0;
+}
+
+static void fpm_http_upstream_writecb(evutil_socket_t fd, short what, void *arg)
+{
+	fpm_http_upstream *up = arg;
+
+	if (up->connecting) {
+		int err = 0;
+		socklen_t len = sizeof(err);
+
+		if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0 || err != 0) {
+			errno = err;
+			fpm_http_upstream_fail(up, 0);
+			return;
+		}
+		up->connecting = 0;
+		event_add(up->ev_read, NULL);
+	}
+	fpm_http_upstream_flush(up);
+}
+
+static void fpm_http_upstream_write(fpm_http_upstream *up, const char *data, size_t len)
+{
+	smart_str_appendl(&up->pending, data, len);
+	if (!up->connecting) {
+		fpm_http_upstream_flush(up);
+	}
 }
 
 static fpm_http_upstream *fpm_http_upstream_new(struct fpm_http_gateway_s *gw)
@@ -540,13 +626,32 @@ static fpm_http_upstream *fpm_http_upstream_new(struct fpm_http_gateway_s *gw)
 	fpm_http_upstream *up = calloc(1, sizeof(*up));
 
 	up->gw = gw;
-	up->bev = bufferevent_socket_new(gw->base, -1, BEV_OPT_CLOSE_ON_FREE);
-	bufferevent_setcb(up->bev, fpm_http_upstream_read, NULL, fpm_http_upstream_event, up);
-	bufferevent_enable(up->bev, EV_READ | EV_WRITE);
-	if (bufferevent_socket_connect(up->bev, (struct sockaddr*)&gw->upstream_addr, gw->upstream_len) != 0) {
-		bufferevent_free(up->bev);
+	up->fd = socket(gw->upstream_addr.ss_family, SOCK_STREAM, 0);
+	if (up->fd < 0) {
 		free(up);
 		return NULL;
+	}
+	evutil_make_socket_nonblocking(up->fd);
+	if (gw->upstream_addr.ss_family != AF_UNIX) {
+		int on = 1;
+
+		setsockopt(up->fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+	}
+	up->ev_read = event_new(gw->base, up->fd, EV_READ | EV_PERSIST, fpm_http_upstream_readcb, up);
+	up->ev_write = event_new(gw->base, up->fd, EV_WRITE, fpm_http_upstream_writecb, up);
+
+	if (connect(up->fd, (struct sockaddr*)&gw->upstream_addr, gw->upstream_len) != 0) {
+		if (errno != EINPROGRESS) {
+			event_free(up->ev_read);
+			event_free(up->ev_write);
+			close(up->fd);
+			free(up);
+			return NULL;
+		}
+		up->connecting = 1;
+		event_add(up->ev_write, NULL);
+	} else {
+		event_add(up->ev_read, NULL);
 	}
 	TAILQ_INSERT_TAIL(&gw->upstreams, up, link);
 	gw->nupstreams++;
@@ -586,8 +691,10 @@ static void fpm_http_pump(struct fpm_http_gateway_s *gw)
 		c->upstream = idle;
 		idle->busy = 1;
 		idle->current = c;
-		bufferevent_set_timeouts(idle->bev, NULL, NULL);
-		bufferevent_write(idle->bev, ZSTR_VAL(c->out.s), ZSTR_LEN(c->out.s));
+		if (idle_ms > 0 && !idle->connecting) {
+			event_add(idle->ev_read, NULL);		/* drop the idle deadline for the duration of the request */
+		}
+		fpm_http_upstream_write(idle, ZSTR_VAL(c->out.s), ZSTR_LEN(c->out.s));
 		smart_str_free(&c->out);
 	}
 }
