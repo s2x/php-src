@@ -1469,6 +1469,9 @@ static PHP_MINFO_FUNCTION(cgi)
 {
 	php_info_print_table_start();
 	php_info_print_table_row(2, "php-fpm", "active");
+#ifdef HAVE_FPM_HTTP
+	php_info_print_table_row(2, "http gateway", "libevent");
+#endif
 	php_info_print_table_end();
 
 	DISPLAY_INI_ENTRIES();

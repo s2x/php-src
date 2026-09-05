@@ -12,6 +12,7 @@
 #include "fpm_cleanup.h"
 #include "fpm_php.h"
 #include "fpm_sockets.h"
+#include "fpm_http.h"
 #include "fpm_unix.h"
 #include "fpm_process_ctl.h"
 #include "fpm_conf.h"
@@ -91,6 +92,9 @@ enum fpm_init_return_status fpm_init(int argc, char **argv, char *config, char *
 int fpm_run(int *max_requests) /* {{{ */
 {
 	struct fpm_worker_pool_s *wp;
+
+	/* HTTP gateways first, so they inherit the same final stdio as the workers */
+	fpm_http_init_main();
 
 	/* create initial children in all pools */
 	for (wp = fpm_worker_all_pools; wp; wp = wp->next) {

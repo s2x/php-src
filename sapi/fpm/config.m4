@@ -293,6 +293,13 @@ if test "$PHP_FPM" != "no"; then
     [no],
     [no])
 
+  PHP_ARG_WITH([fpm-http],
+    [whether to build the plain HTTP gateway in PHP-FPM],
+    [AS_HELP_STRING([--with-fpm-http],
+      [Serve plain HTTP next to FastCGI (requires libevent)])],
+    [no],
+    [no])
+
   PHP_ARG_WITH([fpm-acl],
     [whether to use Access Control Lists (ACL) in PHP-FPM],
     [AS_HELP_STRING([--with-fpm-acl],
@@ -334,6 +341,14 @@ if test "$PHP_FPM" != "no"; then
   ])
 
   AC_SUBST([php_fpm_systemd])
+
+  AS_VAR_IF([PHP_FPM_HTTP], [no],, [
+    PKG_CHECK_MODULES([LIBEVENT], [libevent >= 2.1])
+    AC_DEFINE([HAVE_FPM_HTTP], [1],
+      [Define to 1 if FPM has the plain HTTP gateway.])
+    PHP_EVAL_LIBLINE([$LIBEVENT_LIBS], [FPM_EXTRA_LIBS], [yes])
+    PHP_EVAL_INCLINE([$LIBEVENT_CFLAGS])
+  ])
 
   AS_VAR_IF([PHP_FPM_ACL], [no],, [
     AC_CHECK_HEADERS([sys/acl.h])
@@ -449,6 +464,7 @@ if test "$PHP_FPM" != "no"; then
     fpm/fpm_conf.c \
     fpm/fpm_env.c \
     fpm/fpm_events.c \
+    fpm/fpm_http.c \
     fpm/fpm_log.c \
     fpm/fpm_main.c \
     fpm/fpm_php.c \
