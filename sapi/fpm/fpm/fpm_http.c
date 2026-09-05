@@ -893,10 +893,12 @@ static void fpm_http_gateway_run(struct fpm_http_gateway_s *gw, unsigned index) 
 }
 /* }}} */
 
-/* Listen on the FastCGI address with the port bumped by one. Returns -1 when that is not possible. */
+/* Listens on http_address when given, otherwise on the FastCGI address with the port bumped by
+ * one. Returns -1 when that is not possible. */
 static int fpm_http_listen(const char *pool, const char *listen_address, int backlog, int reuseport) /* {{{ */
 {
-	char *dup_address = strdup(listen_address), *host = NULL, *port_str = strrchr(dup_address, ':');
+	const char *http_address = getenv("FPM_HTTP_LISTEN");
+	char *dup_address = strdup(http_address ? http_address : listen_address), *host = NULL, *port_str = strrchr(dup_address, ':');
 	char port[sizeof("65535")];
 	struct addrinfo hints, *res, *p;
 	int fd = -1, port_no, on = 1;
@@ -911,8 +913,8 @@ static int fpm_http_listen(const char *pool, const char *listen_address, int bac
 	} else {
 		port_str = dup_address;
 	}
-	port_no = atoi(port_str) + 1;
-	if (port_no > 65535) {
+	port_no = atoi(port_str) + (http_address ? 0 : 1);
+	if (port_no < 1 || port_no > 65535) {
 		zlog(ZLOG_WARNING, "[pool %s] no HTTP listener: no port left above '%s'", pool, listen_address);
 		free(dup_address);
 		return -1;
@@ -1010,7 +1012,8 @@ int fpm_http_init_main(void) /* {{{ */
 		unsigned workers = wp->config->pm_max_children > 0 ? (unsigned)wp->config->pm_max_children : 1;
 		unsigned i;
 
-		if (wp->listen_address_domain != FPM_AF_INET) {
+		/* a UNIX socket pool has no port to bump, so it needs an explicit HTTP address */
+		if (wp->listen_address_domain != FPM_AF_INET && !getenv("FPM_HTTP_LISTEN")) {
 			continue;
 		}
 
