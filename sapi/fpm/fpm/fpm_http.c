@@ -13,10 +13,12 @@
  * Persistent connections: a kept FastCGI connection pins one PHP worker, so
  * the gateways together never hold more than pm.max_children of them and
  * requests beyond that wait in the gateway's own queue instead of the kernel
- * backlog. An idle connection is closed after FPM_HTTP_IDLE_MS so that the
- * worker goes back to serving other FastCGI clients (nginx, the status page)
- * when there is no HTTP traffic. This only makes sense with pm = static; with
- * dynamic/ondemand the pinned idle workers do not count as idle.
+ * backlog. A worker waiting for the next request on a kept connection counts
+ * as active, so dynamic spawns spare workers for everyone else as it should.
+ * ondemand never reaps such a worker though, and with any pm a pinned worker
+ * is unavailable to other FastCGI clients (nginx, the status page), so an
+ * idle connection is dropped after FPM_HTTP_IDLE_MS (env override, 0 keeps
+ * them forever).
  */
 
 #include "fpm_config.h"
@@ -81,6 +83,8 @@ struct fpm_http_gateway_s {
 	char *listen_address;			/* where the pool takes FastCGI */
 	char *docroot;
 	int listen_fd;
+	int backlog;
+	int reuseport;					/* every gateway binds its own SO_REUSEPORT socket (FPM_HTTP_REUSEPORT=1) */
 	unsigned nproc;
 	pid_t *pids;
 
@@ -127,8 +131,10 @@ struct _fpm_http_upstream {
 };
 
 static void fpm_http_pump(struct fpm_http_gateway_s *gw);
+static int fpm_http_listen(const char *pool, const char *listen_address, int backlog, int reuseport);
 
-static const struct timeval idle_timeout = {FPM_HTTP_IDLE_MS / 1000, (FPM_HTTP_IDLE_MS % 1000) * 1000};
+static struct timeval idle_timeout = {FPM_HTTP_IDLE_MS / 1000, (FPM_HTTP_IDLE_MS % 1000) * 1000};
+static int idle_ms = FPM_HTTP_IDLE_MS;		/* FPM_HTTP_IDLE_MS env overrides it; 0 = never close */
 
 /* ---------------------------------------------------------------- FastCGI encoding */
 
@@ -442,7 +448,9 @@ static void fpm_http_request_done(fpm_http_upstream *up)
 	up->busy = 0;
 	memset(up->rec_hdr, 0, sizeof(up->rec_hdr));
 	up->rec_hdr_len = up->rec_type = up->rec_len = up->rec_pad = 0;
-	bufferevent_set_timeouts(up->bev, &idle_timeout, NULL);
+	if (idle_ms > 0) {
+		bufferevent_set_timeouts(up->bev, &idle_timeout, NULL);
+	}
 	fpm_http_pump(up->gw);
 }
 
@@ -691,6 +699,15 @@ static void fpm_http_gateway_run(struct fpm_http_gateway_s *gw, unsigned index) 
 	snprintf(title, sizeof(title), "http gateway %s [%u]", gw->pool, index);
 	fpm_env_setproctitle(title);
 
+	if (gw->reuseport) {
+		/* own listening socket in the SO_REUSEPORT group, the kernel spreads connections by hash */
+		close(gw->listen_fd);
+		gw->listen_fd = fpm_http_listen(gw->pool, gw->listen_address, gw->backlog, 1);
+		if (gw->listen_fd < 0) {
+			exit(FPM_EXIT_SOFTWARE);
+		}
+	}
+
 	if (fpm_http_resolve_upstream(gw) != 0) {
 		zlog(ZLOG_ERROR, "[pool %s] http: cannot resolve '%s'", gw->pool, gw->listen_address);
 		exit(FPM_EXIT_SOFTWARE);
@@ -716,9 +733,9 @@ static void fpm_http_gateway_run(struct fpm_http_gateway_s *gw, unsigned index) 
 /* }}} */
 
 /* Listen on the FastCGI address with the port bumped by one. Returns -1 when that is not possible. */
-static int fpm_http_listen(struct fpm_worker_pool_s *wp) /* {{{ */
+static int fpm_http_listen(const char *pool, const char *listen_address, int backlog, int reuseport) /* {{{ */
 {
-	char *dup_address = strdup(wp->config->listen_address), *host = NULL, *port_str = strrchr(dup_address, ':');
+	char *dup_address = strdup(listen_address), *host = NULL, *port_str = strrchr(dup_address, ':');
 	char port[sizeof("65535")];
 	struct addrinfo hints, *res, *p;
 	int fd = -1, port_no, on = 1;
@@ -735,7 +752,7 @@ static int fpm_http_listen(struct fpm_worker_pool_s *wp) /* {{{ */
 	}
 	port_no = atoi(port_str) + 1;
 	if (port_no > 65535) {
-		zlog(ZLOG_WARNING, "[pool %s] no HTTP listener: no port left above '%s'", wp->config->name, wp->config->listen_address);
+		zlog(ZLOG_WARNING, "[pool %s] no HTTP listener: no port left above '%s'", pool, listen_address);
 		free(dup_address);
 		return -1;
 	}
@@ -746,7 +763,7 @@ static int fpm_http_listen(struct fpm_worker_pool_s *wp) /* {{{ */
 	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_flags = AI_PASSIVE;
 	if (getaddrinfo(host, port, &hints, &res) != 0) {
-		zlog(ZLOG_WARNING, "[pool %s] no HTTP listener: cannot resolve '%s'", wp->config->name, wp->config->listen_address);
+		zlog(ZLOG_WARNING, "[pool %s] no HTTP listener: cannot resolve '%s'", pool, listen_address);
 		free(dup_address);
 		return -1;
 	}
@@ -756,8 +773,13 @@ static int fpm_http_listen(struct fpm_worker_pool_s *wp) /* {{{ */
 			continue;
 		}
 		setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-		if (bind(fd, p->ai_addr, p->ai_addrlen) != 0 || listen(fd, wp->config->listen_backlog) != 0) {
-			zlog(ZLOG_WARNING, "[pool %s] no HTTP listener: unable to listen on %s:%s: %s", wp->config->name, host ? host : "*", port, strerror(errno));
+#ifdef SO_REUSEPORT
+		if (reuseport) {
+			setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+		}
+#endif
+		if (bind(fd, p->ai_addr, p->ai_addrlen) != 0 || listen(fd, backlog) != 0) {
+			zlog(ZLOG_WARNING, "[pool %s] no HTTP listener: unable to listen on %s:%s: %s", pool, host ? host : "*", port, strerror(errno));
 			close(fd);
 			fd = -1;
 			break;
@@ -787,7 +809,9 @@ static void fpm_http_cleanup(int which, void *arg) /* {{{ */
 				waitpid(gw->pids[i], NULL, 0);
 			}
 		}
-		close(gw->listen_fd);
+		if (gw->listen_fd >= 0) {
+			close(gw->listen_fd);
+		}
 		free(gw->pids);
 		free(gw->pool);
 		free(gw->listen_address);
@@ -804,6 +828,14 @@ int fpm_http_init_main(void) /* {{{ */
 	char cwd[MAXPATHLEN];
 	const char *env = getenv("FPM_HTTP_GATEWAYS");
 	unsigned nproc_wanted = env && atoi(env) > 0 ? (unsigned)atoi(env) : FPM_HTTP_GATEWAYS_DEFAULT;
+	int reuseport = getenv("FPM_HTTP_REUSEPORT") && atoi(getenv("FPM_HTTP_REUSEPORT")) > 0;
+	const char *idle_env = getenv("FPM_HTTP_IDLE_MS");
+
+	if (idle_env) {
+		idle_ms = atoi(idle_env);
+		idle_timeout.tv_sec = idle_ms / 1000;
+		idle_timeout.tv_usec = (idle_ms % 1000) * 1000;
+	}
 
 	if (!getcwd(cwd, sizeof(cwd))) {
 		strcpy(cwd, "/");
@@ -822,7 +854,9 @@ int fpm_http_init_main(void) /* {{{ */
 		gw->pool = strdup(wp->config->name);
 		gw->listen_address = strdup(wp->config->listen_address);
 		gw->docroot = strdup(wp->config->chdir && *wp->config->chdir ? wp->config->chdir : cwd);
-		gw->listen_fd = fpm_http_listen(wp);
+		gw->backlog = wp->config->listen_backlog;
+		gw->reuseport = reuseport;
+		gw->listen_fd = fpm_http_listen(gw->pool, gw->listen_address, gw->backlog, reuseport);
 		if (gw->listen_fd < 0) {
 			free(gw->pool);
 			free(gw->listen_address);
@@ -835,8 +869,8 @@ int fpm_http_init_main(void) /* {{{ */
 		gw->pids = calloc(gw->nproc, sizeof(pid_t));
 		gw->next = gateways;
 		gateways = gw;
-		zlog(ZLOG_NOTICE, "[pool %s] HTTP listener on FastCGI port + 1: %u gateway(s), %u persistent connection(s) to the pool",
-			wp->config->name, gw->nproc, workers);
+		zlog(ZLOG_NOTICE, "[pool %s] HTTP listener on FastCGI port + 1: %u gateway(s)%s, %u persistent connection(s) to the pool",
+			wp->config->name, gw->nproc, reuseport ? " with SO_REUSEPORT" : "", workers);
 
 		for (i = 0; i < gw->nproc; i++) {
 			gw->pids[i] = fork();
@@ -847,6 +881,11 @@ int fpm_http_init_main(void) /* {{{ */
 				fpm_http_gateway_run(gw, i);
 				/* not reached */
 			}
+		}
+		if (reuseport) {
+			/* the master's socket would otherwise take its share of connections and never accept them */
+			close(gw->listen_fd);
+			gw->listen_fd = -1;
 		}
 	}
 
