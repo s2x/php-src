@@ -39,7 +39,65 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/types.h>
-#include <sys/queue.h>
+/* musl does not ship <sys/queue.h>, and libevent's headers may pull in a partial
+ * one, so include it when it exists and fill in only what is missing. */
+#if defined(__has_include)
+# if __has_include(<sys/queue.h>)
+#  include <sys/queue.h>
+# endif
+#endif
+
+#ifndef TAILQ_HEAD
+#define TAILQ_HEAD(name, type)						\
+struct name {								\
+	struct type *tqh_first;						\
+	struct type **tqh_last;						\
+}
+#endif
+#ifndef TAILQ_ENTRY
+#define TAILQ_ENTRY(type)						\
+struct {								\
+	struct type *tqe_next;						\
+	struct type **tqe_prev;						\
+}
+#endif
+#ifndef TAILQ_INIT
+#define TAILQ_INIT(head) do {						\
+	(head)->tqh_first = NULL;					\
+	(head)->tqh_last = &(head)->tqh_first;				\
+} while (0)
+#endif
+#ifndef TAILQ_EMPTY
+#define TAILQ_EMPTY(head)	((head)->tqh_first == NULL)
+#endif
+#ifndef TAILQ_FIRST
+#define TAILQ_FIRST(head)	((head)->tqh_first)
+#endif
+#ifndef TAILQ_NEXT
+#define TAILQ_NEXT(elm, field)	((elm)->field.tqe_next)
+#endif
+#ifndef TAILQ_FOREACH
+#define TAILQ_FOREACH(var, head, field)					\
+	for ((var) = TAILQ_FIRST(head); (var); (var) = TAILQ_NEXT(var, field))
+#endif
+#ifndef TAILQ_INSERT_TAIL
+#define TAILQ_INSERT_TAIL(head, elm, field) do {			\
+	(elm)->field.tqe_next = NULL;					\
+	(elm)->field.tqe_prev = (head)->tqh_last;			\
+	*(head)->tqh_last = (elm);					\
+	(head)->tqh_last = &(elm)->field.tqe_next;			\
+} while (0)
+#endif
+#ifndef TAILQ_REMOVE
+#define TAILQ_REMOVE(head, elm, field) do {				\
+	if (((elm)->field.tqe_next) != NULL)				\
+		(elm)->field.tqe_next->field.tqe_prev =			\
+		    (elm)->field.tqe_prev;				\
+	else								\
+		(head)->tqh_last = (elm)->field.tqe_prev;		\
+	*(elm)->field.tqe_prev = (elm)->field.tqe_next;			\
+} while (0)
+#endif
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
