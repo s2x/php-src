@@ -1,13 +1,22 @@
 /* Plain HTTP gateway for a pool (--with-fpm-http, needs libevent).
  *
- * For every TCP pool the master forks one gateway process that serves plain
- * HTTP on the FastCGI port + 1 with libevent's evhttp. The gateway behaves
- * like a web server in front of the pool: it connects to the pool's FastCGI
- * socket, sends the request as FastCGI records and turns the FastCGI response
- * back into HTTP. Neither the FastCGI code nor the PHP workers know that HTTP
+ * For every TCP pool the master forks a few gateway processes that serve
+ * plain HTTP on the FastCGI port + 1 with libevent's evhttp, sharing one
+ * listening socket. A gateway behaves like a web server in front of the pool:
+ * it talks FastCGI to the pool over a small set of persistent connections,
+ * sends the request as FastCGI records and turns the FastCGI response back
+ * into HTTP. Neither the FastCGI code nor the PHP workers know that HTTP
  * exists. Keep-alive, chunked request bodies, HEAD and request parsing are
  * evhttp's job. Without libevent the gateway is compiled out and FPM behaves
  * as before.
+ *
+ * Persistent connections: a kept FastCGI connection pins one PHP worker, so
+ * the gateways together never hold more than pm.max_children of them and
+ * requests beyond that wait in the gateway's own queue instead of the kernel
+ * backlog. An idle connection is closed after FPM_HTTP_IDLE_MS so that the
+ * worker goes back to serving other FastCGI clients (nginx, the status page)
+ * when there is no HTTP traffic. This only makes sense with pm = static; with
+ * dynamic/ondemand the pinned idle workers do not count as idle.
  */
 
 #include "fpm_config.h"
@@ -55,45 +64,71 @@
 #include "fpm_env.h"
 #include "zlog.h"
 
+#define FPM_HTTP_GATEWAYS_DEFAULT 2			/* overridable with FPM_HTTP_GATEWAYS until there is a directive */
+#define FPM_HTTP_IDLE_MS         500		/* release a pinned worker after this much idle time */
 #define FPM_HTTP_MAX_BODY        (32 * 1024 * 1024)
 #define FPM_HTTP_MAX_CGI_HEADERS (64 * 1024)
 #define FCGI_MAX_RECORD_LEN      0xffff
 #define FPM_HTTP_BAD_GATEWAY     502 /* libevent has no constant for it */
 
-/* one gateway per pool */
+typedef struct _fpm_http_conn fpm_http_conn;
+typedef struct _fpm_http_upstream fpm_http_upstream;
+
+/* one gateway family per pool */
 struct fpm_http_gateway_s {
 	struct fpm_http_gateway_s *next;
 	char *pool;
 	char *listen_address;			/* where the pool takes FastCGI */
 	char *docroot;
 	int listen_fd;
-	pid_t pid;
+	unsigned nproc;
+	pid_t *pids;
 
 	/* gateway process only */
+	unsigned max_upstreams;			/* this process' share of the pool's workers */
 	struct event_base *base;
 	struct evhttp *http;
-	struct sockaddr_storage upstream;
+	struct sockaddr_storage upstream_addr;
 	socklen_t upstream_len;
+	TAILQ_HEAD(, _fpm_http_upstream) upstreams;
+	unsigned nupstreams;
+	TAILQ_HEAD(, _fpm_http_conn) waiting;	/* requests without a free connection yet */
 };
 
 static struct fpm_http_gateway_s *gateways = NULL;
 
 /* one HTTP request being proxied */
-typedef struct _fpm_http_conn {
+struct _fpm_http_conn {
 	struct fpm_http_gateway_s *gw;
 	struct evhttp_request *req;
 	struct evhttp_connection *evcon;
-	struct bufferevent *bev;			/* to the pool */
+	fpm_http_upstream *upstream;		/* while in flight */
+	int queued;
+	TAILQ_ENTRY(_fpm_http_conn) link;
 
 	smart_str params;					/* FCGI_PARAMS payload being assembled */
 	smart_str out;						/* records ready to go upstream */
 
+	smart_str cgi_headers;				/* CGI header block until it is complete */
+	int headers_sent;
+};
+
+/* one persistent FastCGI connection to the pool, serving one request at a time */
+struct _fpm_http_upstream {
+	struct fpm_http_gateway_s *gw;
+	struct bufferevent *bev;
+	int busy;							/* a request is in flight, even if its client is gone */
+	fpm_http_conn *current;				/* NULL when idle or when the client went away */
+	TAILQ_ENTRY(_fpm_http_upstream) link;
+
 	/* FastCGI record stream from the pool */
 	unsigned char rec_hdr[8];
 	int rec_hdr_len, rec_type, rec_len, rec_pad;
-	smart_str cgi_headers;				/* CGI header block until it is complete */
-	int headers_sent;
-} fpm_http_conn;
+};
+
+static void fpm_http_pump(struct fpm_http_gateway_s *gw);
+
+static const struct timeval idle_timeout = {FPM_HTTP_IDLE_MS / 1000, (FPM_HTTP_IDLE_MS % 1000) * 1000};
 
 /* ---------------------------------------------------------------- FastCGI encoding */
 
@@ -154,7 +189,7 @@ static const char *fpm_http_method_name(enum evhttp_cmd_type type)
 /* Builds BEGIN_REQUEST, PARAMS and STDIN in c->out. Returns an HTTP error code or 0. */
 static int fpm_http_build_request(fpm_http_conn *c)
 {
-	static const char begin_request[8] = {0, FCGI_RESPONDER, 0 /* no FCGI_KEEP_CONN */, 0, 0, 0, 0, 0};
+	static const char begin_request[8] = {0, FCGI_RESPONDER, FCGI_KEEP_CONN, 0, 0, 0, 0, 0};
 	struct evhttp_request *req = c->req;
 	const struct evhttp_uri *uri = evhttp_request_get_evhttp_uri(req);
 	const char *method = fpm_http_method_name(evhttp_request_get_command(req));
@@ -273,8 +308,8 @@ static void fpm_http_conn_free(fpm_http_conn *c)
 	if (c->evcon) {
 		evhttp_connection_set_closecb(c->evcon, NULL, NULL);
 	}
-	if (c->bev) {
-		bufferevent_free(c->bev);
+	if (c->queued) {
+		TAILQ_REMOVE(&c->gw->waiting, c, link);
 	}
 	smart_str_free(&c->params);
 	smart_str_free(&c->out);
@@ -370,48 +405,7 @@ static void fpm_http_stdout(fpm_http_conn *c, const char *data, size_t len)
 	}
 }
 
-/* Feeds bytes from the pool into the record parser. Returns 1 when END_REQUEST was seen. */
-static int fpm_http_upstream_data(fpm_http_conn *c, const char *buf, size_t len)
-{
-	while (len > 0) {
-		size_t take;
-
-		if (c->rec_len == 0 && c->rec_pad == 0) {
-			take = MIN(sizeof(c->rec_hdr) - c->rec_hdr_len, len);
-			memcpy(c->rec_hdr + c->rec_hdr_len, buf, take);
-			c->rec_hdr_len += take;
-			buf += take;
-			len -= take;
-			if (c->rec_hdr_len < (int)sizeof(c->rec_hdr)) {
-				break;
-			}
-			c->rec_hdr_len = 0;
-			c->rec_type = c->rec_hdr[1];
-			c->rec_len = (c->rec_hdr[4] << 8) | c->rec_hdr[5];
-			c->rec_pad = c->rec_hdr[6];
-			if (c->rec_type == FCGI_END_REQUEST) {
-				return 1;
-			}
-			continue;
-		}
-		if (c->rec_len > 0) {
-			take = MIN((size_t)c->rec_len, len);
-			if (c->rec_type == FCGI_STDOUT) {
-				fpm_http_stdout(c, buf, take);
-			} else if (c->rec_type == FCGI_STDERR) {
-				zlog(ZLOG_NOTICE, "[pool %s] http: %.*s", c->gw->pool, (int)take, buf);
-			}
-			c->rec_len -= take;
-		} else {
-			take = MIN((size_t)c->rec_pad, len);
-			c->rec_pad -= take;
-		}
-		buf += take;
-		len -= take;
-	}
-	return 0;
-}
-
+/* The pool is done with the request (END_REQUEST seen or the connection failed). */
 static void fpm_http_finish(fpm_http_conn *c, int upstream_ok)
 {
 	if (c->headers_sent) {
@@ -428,48 +422,188 @@ static void fpm_http_finish(fpm_http_conn *c, int upstream_ok)
 	fpm_http_conn_free(c);
 }
 
+/* ---------------------------------------------------------------- upstream connections */
+
+static void fpm_http_upstream_drop(fpm_http_upstream *up)
+{
+	TAILQ_REMOVE(&up->gw->upstreams, up, link);
+	up->gw->nupstreams--;
+	bufferevent_free(up->bev);
+	free(up);
+}
+
+/* one request finished on this connection, it is free for the next */
+static void fpm_http_request_done(fpm_http_upstream *up)
+{
+	if (up->current) {
+		fpm_http_finish(up->current, 1);
+		up->current = NULL;
+	}
+	up->busy = 0;
+	memset(up->rec_hdr, 0, sizeof(up->rec_hdr));
+	up->rec_hdr_len = up->rec_type = up->rec_len = up->rec_pad = 0;
+	bufferevent_set_timeouts(up->bev, &idle_timeout, NULL);
+	fpm_http_pump(up->gw);
+}
+
+/* Feeds bytes from the pool into the record parser. */
+static void fpm_http_upstream_data(fpm_http_upstream *up, const char *buf, size_t len)
+{
+	while (len > 0) {
+		size_t take;
+
+		if (up->rec_len == 0 && up->rec_pad == 0) {
+			take = MIN(sizeof(up->rec_hdr) - up->rec_hdr_len, len);
+			memcpy(up->rec_hdr + up->rec_hdr_len, buf, take);
+			up->rec_hdr_len += take;
+			buf += take;
+			len -= take;
+			if (up->rec_hdr_len < (int)sizeof(up->rec_hdr)) {
+				break;
+			}
+			up->rec_hdr_len = 0;
+			up->rec_type = up->rec_hdr[1];
+			up->rec_len = (up->rec_hdr[4] << 8) | up->rec_hdr[5];
+			up->rec_pad = up->rec_hdr[6];
+			if (up->rec_len == 0 && up->rec_pad == 0 && up->rec_type == FCGI_END_REQUEST) {
+				fpm_http_request_done(up);
+			}
+			continue;
+		}
+		if (up->rec_len > 0) {
+			take = MIN((size_t)up->rec_len, len);
+			if (up->rec_type == FCGI_STDOUT && up->current) {
+				fpm_http_stdout(up->current, buf, take);
+			} else if (up->rec_type == FCGI_STDERR) {
+				zlog(ZLOG_NOTICE, "[pool %s] http: %.*s", up->gw->pool, (int)take, buf);
+			}
+			up->rec_len -= take;
+		} else {
+			take = MIN((size_t)up->rec_pad, len);
+			up->rec_pad -= take;
+		}
+		buf += take;
+		len -= take;
+		if (up->rec_len == 0 && up->rec_pad == 0 && up->rec_type == FCGI_END_REQUEST) {
+			fpm_http_request_done(up);
+		}
+	}
+}
+
 static void fpm_http_upstream_read(struct bufferevent *bev, void *arg)
 {
-	fpm_http_conn *c = arg;
 	struct evbuffer *in = bufferevent_get_input(bev);
 	size_t len = evbuffer_get_length(in);
-	int done = fpm_http_upstream_data(c, (const char*)evbuffer_pullup(in, -1), len);
 
+	fpm_http_upstream_data(arg, (const char*)evbuffer_pullup(in, -1), len);
 	evbuffer_drain(in, len);
-	if (done) {
-		fpm_http_finish(c, 1);
-	}
 }
 
 static void fpm_http_upstream_event(struct bufferevent *bev, short what, void *arg)
 {
-	fpm_http_conn *c = arg;
+	fpm_http_upstream *up = arg;
+	struct fpm_http_gateway_s *gw = up->gw;
 
 	if (what & BEV_EVENT_CONNECTED) {
 		return;
 	}
+	if (what & BEV_EVENT_TIMEOUT) {
+		/* idle for a while: give the worker back to the pool */
+		if (!up->busy) {
+			fpm_http_upstream_drop(up);
+		}
+		return;
+	}
 	if (what & BEV_EVENT_ERROR) {
-		zlog(ZLOG_WARNING, "[pool %s] http: upstream '%s': %s", c->gw->pool, c->gw->listen_address,
+		zlog(ZLOG_WARNING, "[pool %s] http: upstream '%s': %s", gw->pool, gw->listen_address,
 			evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()));
 	}
-	fpm_http_finish(c, !(what & BEV_EVENT_ERROR));
+	/* EOF is normal after pm.max_requests or a worker restart; the request in flight is lost though */
+	if (up->current) {
+		fpm_http_finish(up->current, !(what & BEV_EVENT_ERROR));
+		up->current = NULL;
+	}
+	fpm_http_upstream_drop(up);
+	fpm_http_pump(gw);
 }
 
-/* the client went away before the pool answered */
+static fpm_http_upstream *fpm_http_upstream_new(struct fpm_http_gateway_s *gw)
+{
+	fpm_http_upstream *up = calloc(1, sizeof(*up));
+
+	up->gw = gw;
+	up->bev = bufferevent_socket_new(gw->base, -1, BEV_OPT_CLOSE_ON_FREE);
+	bufferevent_setcb(up->bev, fpm_http_upstream_read, NULL, fpm_http_upstream_event, up);
+	bufferevent_enable(up->bev, EV_READ | EV_WRITE);
+	if (bufferevent_socket_connect(up->bev, (struct sockaddr*)&gw->upstream_addr, gw->upstream_len) != 0) {
+		bufferevent_free(up->bev);
+		free(up);
+		return NULL;
+	}
+	TAILQ_INSERT_TAIL(&gw->upstreams, up, link);
+	gw->nupstreams++;
+	return up;
+}
+
+/* Hands waiting requests to free connections, opening new ones up to this process' share. */
+static void fpm_http_pump(struct fpm_http_gateway_s *gw)
+{
+	while (!TAILQ_EMPTY(&gw->waiting)) {
+		fpm_http_upstream *up, *idle = NULL;
+		fpm_http_conn *c;
+
+		TAILQ_FOREACH(up, &gw->upstreams, link) {
+			if (!up->busy) {
+				idle = up;
+				break;
+			}
+		}
+		if (!idle && gw->nupstreams < gw->max_upstreams) {
+			idle = fpm_http_upstream_new(gw);
+			if (!idle && gw->nupstreams == 0) {
+				/* cannot even open one connection: fail the whole queue instead of hanging it */
+				while ((c = TAILQ_FIRST(&gw->waiting))) {
+					fpm_http_finish(c, 0);
+				}
+				return;
+			}
+		}
+		if (!idle) {
+			return; /* everything busy, the next END_REQUEST calls us again */
+		}
+
+		c = TAILQ_FIRST(&gw->waiting);
+		TAILQ_REMOVE(&gw->waiting, c, link);
+		c->queued = 0;
+		c->upstream = idle;
+		idle->busy = 1;
+		idle->current = c;
+		bufferevent_set_timeouts(idle->bev, NULL, NULL);
+		bufferevent_write(idle->bev, ZSTR_VAL(c->out.s), ZSTR_LEN(c->out.s));
+		smart_str_free(&c->out);
+	}
+}
+
+/* the client went away: stop writing to it, but let the pool finish so the connection stays usable */
 static void fpm_http_client_closed(struct evhttp_connection *evcon, void *arg)
 {
 	fpm_http_conn *c = arg;
 
 	c->evcon = NULL;
+	if (c->upstream) {
+		c->upstream->current = NULL;
+		c->upstream = NULL;
+	}
 	fpm_http_conn_free(c);
 }
 
 static void fpm_http_request(struct evhttp_request *req, void *arg)
 {
+	struct fpm_http_gateway_s *gw = arg;
 	fpm_http_conn *c = calloc(1, sizeof(*c));
 	int error;
 
-	c->gw = arg;
+	c->gw = gw;
 	c->req = req;
 	c->evcon = evhttp_request_get_connection(req);
 
@@ -480,16 +614,10 @@ static void fpm_http_request(struct evhttp_request *req, void *arg)
 		return;
 	}
 
-	c->bev = bufferevent_socket_new(c->gw->base, -1, BEV_OPT_CLOSE_ON_FREE);
-	bufferevent_setcb(c->bev, fpm_http_upstream_read, NULL, fpm_http_upstream_event, c);
-	bufferevent_enable(c->bev, EV_READ | EV_WRITE);
-	bufferevent_write(c->bev, ZSTR_VAL(c->out.s), ZSTR_LEN(c->out.s));
-	smart_str_free(&c->out);
 	evhttp_connection_set_closecb(c->evcon, fpm_http_client_closed, c);
-
-	if (bufferevent_socket_connect(c->bev, (struct sockaddr*)&c->gw->upstream, c->gw->upstream_len) != 0) {
-		fpm_http_finish(c, 0);
-	}
+	TAILQ_INSERT_TAIL(&gw->waiting, c, link);
+	c->queued = 1;
+	fpm_http_pump(gw);
 }
 
 /* ---------------------------------------------------------------- processes */
@@ -499,7 +627,7 @@ static int fpm_http_resolve_upstream(struct fpm_http_gateway_s *gw)
 	const char *address = gw->listen_address;
 
 	if (fpm_sockets_domain_from_address(gw->listen_address) == FPM_AF_UNIX) {
-		struct sockaddr_un *sa_un = (struct sockaddr_un*)&gw->upstream;
+		struct sockaddr_un *sa_un = (struct sockaddr_un*)&gw->upstream_addr;
 
 		sa_un->sun_family = AF_UNIX;
 		strlcpy(sa_un->sun_path, address, sizeof(sa_un->sun_path));
@@ -525,7 +653,7 @@ static int fpm_http_resolve_upstream(struct fpm_http_gateway_s *gw)
 		hints.ai_socktype = SOCK_STREAM;
 		ret = getaddrinfo(host ? host : "localhost", port, &hints, &res);
 		if (ret == 0) {
-			memcpy(&gw->upstream, res->ai_addr, res->ai_addrlen);
+			memcpy(&gw->upstream_addr, res->ai_addr, res->ai_addrlen);
 			gw->upstream_len = res->ai_addrlen;
 			freeaddrinfo(res);
 		}
@@ -534,7 +662,7 @@ static int fpm_http_resolve_upstream(struct fpm_http_gateway_s *gw)
 	}
 }
 
-static void fpm_http_gateway_run(struct fpm_http_gateway_s *gw) /* {{{ */
+static void fpm_http_gateway_run(struct fpm_http_gateway_s *gw, unsigned index) /* {{{ */
 {
 	struct fpm_worker_pool_s *wp;
 	struct sigaction act;
@@ -560,13 +688,15 @@ static void fpm_http_gateway_run(struct fpm_http_gateway_s *gw) /* {{{ */
 		close(wp->listening_socket);
 	}
 
-	snprintf(title, sizeof(title), "http gateway %s", gw->pool);
+	snprintf(title, sizeof(title), "http gateway %s [%u]", gw->pool, index);
 	fpm_env_setproctitle(title);
 
 	if (fpm_http_resolve_upstream(gw) != 0) {
 		zlog(ZLOG_ERROR, "[pool %s] http: cannot resolve '%s'", gw->pool, gw->listen_address);
 		exit(FPM_EXIT_SOFTWARE);
 	}
+	TAILQ_INIT(&gw->upstreams);
+	TAILQ_INIT(&gw->waiting);
 
 	gw->base = event_base_new();
 	gw->http = evhttp_new(gw->base);
@@ -633,7 +763,6 @@ static int fpm_http_listen(struct fpm_worker_pool_s *wp) /* {{{ */
 			break;
 		}
 		fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
-		zlog(ZLOG_NOTICE, "[pool %s] HTTP listener on %s:%s", wp->config->name, host ? host : "*", port);
 	}
 	freeaddrinfo(res);
 	free(dup_address);
@@ -644,14 +773,22 @@ static int fpm_http_listen(struct fpm_worker_pool_s *wp) /* {{{ */
 static void fpm_http_cleanup(int which, void *arg) /* {{{ */
 {
 	struct fpm_http_gateway_s *gw, *next;
+	unsigned i;
 
 	for (gw = gateways; gw; gw = next) {
 		next = gw->next;
-		if (gw->pid > 0) {
-			kill(gw->pid, SIGTERM);
-			waitpid(gw->pid, NULL, 0);
+		for (i = 0; i < gw->nproc; i++) {
+			if (gw->pids[i] > 0) {
+				kill(gw->pids[i], SIGTERM);
+			}
+		}
+		for (i = 0; i < gw->nproc; i++) {
+			if (gw->pids[i] > 0) {
+				waitpid(gw->pids[i], NULL, 0);
+			}
 		}
 		close(gw->listen_fd);
+		free(gw->pids);
 		free(gw->pool);
 		free(gw->listen_address);
 		free(gw->docroot);
@@ -665,6 +802,8 @@ int fpm_http_init_main(void) /* {{{ */
 {
 	struct fpm_worker_pool_s *wp;
 	char cwd[MAXPATHLEN];
+	const char *env = getenv("FPM_HTTP_GATEWAYS");
+	unsigned nproc_wanted = env && atoi(env) > 0 ? (unsigned)atoi(env) : FPM_HTTP_GATEWAYS_DEFAULT;
 
 	if (!getcwd(cwd, sizeof(cwd))) {
 		strcpy(cwd, "/");
@@ -672,6 +811,8 @@ int fpm_http_init_main(void) /* {{{ */
 
 	for (wp = fpm_worker_all_pools; wp; wp = wp->next) {
 		struct fpm_http_gateway_s *gw;
+		unsigned workers = wp->config->pm_max_children > 0 ? (unsigned)wp->config->pm_max_children : 1;
+		unsigned i;
 
 		if (wp->listen_address_domain != FPM_AF_INET) {
 			continue;
@@ -689,15 +830,23 @@ int fpm_http_init_main(void) /* {{{ */
 			free(gw);
 			continue;
 		}
+		/* every persistent connection pins a worker, so the gateways share the workers between them */
+		gw->nproc = MIN(nproc_wanted, workers);
+		gw->pids = calloc(gw->nproc, sizeof(pid_t));
 		gw->next = gateways;
 		gateways = gw;
+		zlog(ZLOG_NOTICE, "[pool %s] HTTP listener on FastCGI port + 1: %u gateway(s), %u persistent connection(s) to the pool",
+			wp->config->name, gw->nproc, workers);
 
-		gw->pid = fork();
-		if (gw->pid < 0) {
-			zlog(ZLOG_SYSERROR, "[pool %s] http: fork() failed", wp->config->name);
-		} else if (gw->pid == 0) {
-			fpm_http_gateway_run(gw);
-			/* not reached */
+		for (i = 0; i < gw->nproc; i++) {
+			gw->pids[i] = fork();
+			if (gw->pids[i] < 0) {
+				zlog(ZLOG_SYSERROR, "[pool %s] http: fork() failed", wp->config->name);
+			} else if (gw->pids[i] == 0) {
+				gw->max_upstreams = workers / gw->nproc + (i < workers % gw->nproc ? 1 : 0);
+				fpm_http_gateway_run(gw, i);
+				/* not reached */
+			}
 		}
 	}
 
